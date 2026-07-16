@@ -36,7 +36,7 @@ export function MangaPlayer({ pages, title }: Props) {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
   const audioDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const freqDataRef = useRef<Uint8Array | null>(null);
+  const freqDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
 
   const [playing, setPlaying] = useState(false);
   const [currentIdx, setCurrentIdx] = useState(0);
@@ -79,7 +79,7 @@ export function MangaPlayer({ pages, title }: Props) {
     audioSrcRef.current = src;
     analyserRef.current = analyser;
     audioDestRef.current = dest;
-    freqDataRef.current = new Uint8Array(analyser.frequencyBinCount);
+    freqDataRef.current = new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount));
   };
 
   // Preload images
