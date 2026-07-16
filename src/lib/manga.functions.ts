@@ -116,13 +116,15 @@ export const processPage = createServerFn({ method: "POST" })
       throw new Error(`TTS failed [${ttsRes.status}]: ${body.slice(0, 300)}`);
     }
     const audioBuf = await ttsRes.arrayBuffer();
+    if (!audioBuf.byteLength) throw new Error("TTS returned empty audio");
 
     // Upload audio to storage (same folder as user for RLS).
     const audioPath = `${userId}/${data.projectId}/audio-${String(data.pageNumber).padStart(4, "0")}.mp3`;
+    const audioBlob = new Blob([audioBuf], { type: "audio/mpeg" });
     const { error: upErr } = await supabase.storage
       .from("manga")
-      .upload(audioPath, new Uint8Array(audioBuf), { contentType: "audio/mpeg", upsert: true });
-    if (upErr) throw new Error(`Audio upload failed: ${upErr.message}`);
+      .upload(audioPath, audioBlob, { contentType: "audio/mpeg", upsert: true });
+    if (upErr) throw new Error(`Audio upload failed: ${upErr.message} (bytes=${audioBuf.byteLength})`);
 
     // Approximate duration: ~155 wpm speech = ~2.6 words/sec.
     const words = narration.split(/\s+/).filter(Boolean).length;
