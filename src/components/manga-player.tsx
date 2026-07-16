@@ -32,12 +32,55 @@ export function MangaPlayer({ pages, title }: Props) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const rafRef = useRef<number | null>(null);
   const imgCacheRef = useRef<Map<number, HTMLImageElement>>(new Map());
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const audioDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const freqDataRef = useRef<Uint8Array | null>(null);
 
   const [playing, setPlaying] = useState(false);
   const [currentIdx, setCurrentIdx] = useState(0);
   const [pageStart, setPageStart] = useState(0);
   const [recording, setRecording] = useState(false);
   const [recorderReady, setRecorderReady] = useState<{ url: string } | null>(null);
+
+  // Detect action/SFX intensity from narration text (bigger shake, more speed lines).
+  const intensityFor = (text: string): number => {
+    const t = text.toLowerCase();
+    const kws = [
+      "slash", "crash", "boom", "explod", "smash", "punch", "kick", "roar",
+      "scream", "shout", "burst", "shatter", "blast", "strike", "attack",
+      "run", "fight", "clash", "impact", "rush", "charge", "leap",
+    ];
+    let score = 0;
+    for (const k of kws) if (t.includes(k)) score += 0.35;
+    if (/!{1,}/.test(text)) score += 0.25;
+    if (/[A-Z]{4,}/.test(text)) score += 0.25;
+    return Math.min(1, score);
+  };
+
+  const ensureAudioGraph = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audioCtxRef.current) return;
+    const Ctor: typeof AudioContext =
+      (window as unknown as { AudioContext: typeof AudioContext; webkitAudioContext?: typeof AudioContext })
+        .AudioContext ??
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new Ctor();
+    const src = ctx.createMediaElementSource(audio);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    const dest = ctx.createMediaStreamDestination();
+    src.connect(analyser);
+    analyser.connect(ctx.destination);
+    analyser.connect(dest);
+    audioCtxRef.current = ctx;
+    audioSrcRef.current = src;
+    analyserRef.current = analyser;
+    audioDestRef.current = dest;
+    freqDataRef.current = new Uint8Array(analyser.frequencyBinCount);
+  };
 
   // Preload images
   useEffect(() => {
@@ -61,6 +104,21 @@ export function MangaPlayer({ pages, title }: Props) {
     const W = canvas.width;
     const H = canvas.height;
 
+    // Audio amplitude (0..1) for shake + pulse
+    let amp = 0;
+    const analyser = analyserRef.current;
+    const freq = freqDataRef.current;
+    if (analyser && freq) {
+      analyser.getByteFrequencyData(freq);
+      let sum = 0;
+      for (let i = 0; i < freq.length; i++) sum += freq[i];
+      amp = Math.min(1, sum / (freq.length * 180));
+    }
+    const intensity = intensityFor(`${page.subtitle} ${page.narration}`);
+    const shakeMag = (2 + intensity * 14) * (0.4 + amp * 1.4);
+    const shakeX = (Math.random() - 0.5) * shakeMag;
+    const shakeY = (Math.random() - 0.5) * shakeMag;
+
     // Background
     ctx.fillStyle = "#0a0608";
     ctx.fillRect(0, 0, W, H);
@@ -70,7 +128,10 @@ export function MangaPlayer({ pages, title }: Props) {
       const t = Math.max(0, Math.min(1, elapsed / page.durationMs));
       const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
       const m = motionFor(currentIdx);
-      const scale = m.fromScale + (m.toScale - m.fromScale) * eased;
+      // Zoom-punch: extra scale kick at page start (first ~250ms)
+      const punchT = Math.min(1, elapsed / 250);
+      const punch = (1 - punchT) * (0.08 + intensity * 0.14);
+      const scale = m.fromScale + (m.toScale - m.fromScale) * eased + punch;
       const offX = (m.fromX + (m.toX - m.fromX) * eased) * W;
       const offY = (m.fromY + (m.toY - m.fromY) * eased) * H;
 
@@ -78,9 +139,38 @@ export function MangaPlayer({ pages, title }: Props) {
       const scaleFit = Math.min(W / img.naturalWidth, H / img.naturalHeight) * scale;
       const dW = img.naturalWidth * scaleFit;
       const dH = img.naturalHeight * scaleFit;
-      const dx = (W - dW) / 2 + offX;
-      const dy = (H - dH) / 2 + offY;
+      const dx = (W - dW) / 2 + offX + shakeX;
+      const dy = (H - dH) / 2 + offY + shakeY;
       ctx.drawImage(img, dx, dy, dW, dH);
+
+      // Speed lines overlay — radial streaks on action pages
+      if (intensity > 0.2) {
+        const lineCount = Math.round(30 + intensity * 60);
+        ctx.save();
+        ctx.globalCompositeOperation = "screen";
+        ctx.strokeStyle = `rgba(255,240,230,${0.08 + intensity * 0.22})`;
+        ctx.lineWidth = 1.2;
+        const cx = W / 2;
+        const cy = H / 2;
+        const seed = Math.floor(elapsed / 80);
+        for (let i = 0; i < lineCount; i++) {
+          const a = ((i * 37 + seed * 13) % 360) * (Math.PI / 180);
+          const r0 = W * (0.28 + ((i * 17) % 15) / 100);
+          const r1 = W * (0.55 + ((i * 23) % 25) / 100);
+          ctx.beginPath();
+          ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+          ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      // Impact flash at page start
+      const flashT = Math.min(1, elapsed / 220);
+      if (flashT < 1) {
+        ctx.fillStyle = `rgba(255,255,255,${(1 - flashT) * 0.55})`;
+        ctx.fillRect(0, 0, W, H);
+      }
 
       // Vignette
       const g = ctx.createRadialGradient(W / 2, H / 2, W * 0.3, W / 2, H / 2, W * 0.75);
@@ -89,27 +179,43 @@ export function MangaPlayer({ pages, title }: Props) {
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, W, H);
 
-      // Subtitle band
+      // Subtitle band — bouncy pop-in synced to audio pulse
       const sub = page.subtitle || page.narration;
-      const bandH = Math.round(H * 0.14);
-      ctx.fillStyle = "rgba(0,0,0,0.72)";
-      ctx.fillRect(0, H - bandH, W, bandH);
-      ctx.fillStyle = "#e94b3c";
-      ctx.fillRect(0, H - bandH, W, 3);
-
+      const popT = Math.min(1, elapsed / 320);
+      const popScale = 0.9 + popT * (1 + Math.sin(popT * Math.PI) * 0.08);
+      const bandH = Math.round(H * 0.16);
+      const bandY = H - bandH;
+      ctx.save();
+      ctx.translate(W / 2, bandY + bandH / 2);
+      ctx.scale(1, popScale);
+      ctx.translate(-W / 2, -(bandY + bandH / 2));
+      ctx.fillStyle = "rgba(0,0,0,0.78)";
+      ctx.fillRect(0, bandY, W, bandH);
+      // Accent bar pulses with audio
+      const barH = 3 + amp * 6;
+      ctx.fillStyle = `rgba(233,75,60,${0.85 + amp * 0.15})`;
+      ctx.fillRect(0, bandY, W, barH);
       ctx.fillStyle = "#f7ede2";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      const fontSize = Math.round(W * 0.026);
-      ctx.font = `600 ${fontSize}px Inter, sans-serif`;
-      wrapText(ctx, sub, W / 2, H - bandH / 2, W * 0.86, fontSize * 1.25);
+      const fontSize = Math.round(W * 0.028 * (1 + amp * 0.05));
+      ctx.font = `700 ${fontSize}px Inter, sans-serif`;
+      wrapText(ctx, sub, W / 2, bandY + bandH / 2, W * 0.86, fontSize * 1.25);
+      ctx.restore();
+
+      // "Talking" indicator — small pulsing dot beside the page counter
+      const dotR = 6 + amp * 10;
+      ctx.fillStyle = `rgba(233,75,60,${0.4 + amp * 0.6})`;
+      ctx.beginPath();
+      ctx.arc(W - 60, 36, dotR, 0, Math.PI * 2);
+      ctx.fill();
 
       // Page counter
       ctx.fillStyle = "rgba(233,75,60,0.85)";
       ctx.textAlign = "right";
       ctx.textBaseline = "top";
       ctx.font = `${Math.round(W * 0.03)}px 'Bebas Neue', Impact, sans-serif`;
-      ctx.fillText(`${page.pageNumber} / ${pages.length}`, W - 24, 22);
+      ctx.fillText(`${page.pageNumber} / ${pages.length}`, W - 84, 22);
 
       // Title top-left
       ctx.fillStyle = "rgba(247,237,226,0.9)";
@@ -148,6 +254,8 @@ export function MangaPlayer({ pages, title }: Props) {
     if (audio && page.audioUrl) {
       audio.src = page.audioUrl;
       audio.currentTime = 0;
+      ensureAudioGraph();
+      audioCtxRef.current?.resume().catch(() => {});
       audio.play().catch(() => {});
     }
     setPageStart(performance.now());
@@ -202,18 +310,10 @@ export function MangaPlayer({ pages, title }: Props) {
     setRecorderReady(null);
     setRecording(true);
 
-    // Combine canvas video + audio element stream
+    // Combine canvas video + audio element stream (reuse the shared audio graph)
     const canvasStream = canvas.captureStream(30);
-    const audio = audioRef.current!;
-    const AudioCtxCtor: typeof AudioContext =
-      (window as unknown as { AudioContext: typeof AudioContext; webkitAudioContext?: typeof AudioContext })
-        .AudioContext ??
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const audioCtx = new AudioCtxCtor();
-    const dest = audioCtx.createMediaStreamDestination();
-    const source = audioCtx.createMediaElementSource(audio);
-    source.connect(dest);
-    source.connect(audioCtx.destination);
+    ensureAudioGraph();
+    const dest = audioDestRef.current!;
 
     const combined = new MediaStream([
       ...canvasStream.getVideoTracks(),
